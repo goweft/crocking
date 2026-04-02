@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+crocking — AI authorship detector for git repositories.
+
+Analyzes git commit history for statistical signatures of AI-generated code.
+Detects known tool markers, commit message patterns, timing anomalies,
+diff structure signals, and code style uniformity that indicate undisclosed
+AI authorship.
+
+Not to block AI use — to detect undisclosed AI authorship for compliance,
+licensing, and trust.
+
+Zero external dependencies. Uses only Python stdlib + git CLI.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+__version__ = "0.1.0"
+
+class Confidence(Enum):
+    DEFINITIVE = "DEFINITIVE"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+    @property
+    def weight(self):
+        return {Confidence.DEFINITIVE: 1.0, Confidence.HIGH: 0.7, Confidence.MEDIUM: 0.4, Confidence.LOW: 0.15}[self]
+
+    @property
+    def color(self):
+        return {Confidence.DEFINITIVE: "\033[91m", Confidence.HIGH: "\033[93m", Confidence.MEDIUM: "\033[96m", Confidence.LOW: "\033[90m"}[self]
+
+@dataclass
+class Signal:
+    rule_id: str
+    confidence: Confidence
+    commit_hash: str
+    message: str
+    detail: str = ""
+    def to_dict(self):
+        d = {"rule_id": self.rule_id, "confidence": self.confidence.value, "commit_hash": self.commit_hash[:8], "message": self.message}
+        if self.detail: d["detail"] = self.detail
+        return d
+
+@dataclass
+class AuthorProfile:
+    name: str
+    email: str
+    total_commits: int = 0
+    signals: list = field(default_factory=list)
+    ai_score: float = 0.0
+    def to_dict(self):
+        return {"name": self.name, "email": self.email, "total_commits": self.total_commits, "ai_score": round(self.ai_score, 1), "signal_count": len(self.signals), "signals": [s.to_dict() for s in self.signals]}
+
+@dataclass
+class ScanReport:
+    repo_path: str
+    total_commits: int = 0
+    total_authors: int = 0
+    ai_commit_estimate: int = 0
+    overall_ai_percentage: float = 0.0
+    authors: list = field(default_factory=list)
+    signals: list = field(default_factory=list)
+    file_markers: list = field(default_factory=list)
+    def to_dict(self):
+        return {"version": __version__, "repo_path": self.repo_path, "total_commits": self.total_commits, "total_authors": self.total_authors, "ai_commit_estimate": self.ai_commit_estimate, "overall_ai_percentage": round(self.overall_ai_percentage, 1), "authors": [a.to_dict() for a in self.authors], "file_markers": self.file_markers, "signal_count": len(self.signals)}
+
+AI_TRAILER_PATTERNS = [
+    (re.compile(r"Co-authored-by:.*(?:copilot|github-actions\[bot\]|dependabot)", re.IGNORECASE), "GitHub Copilot/bot co-author trailer", Confidence.DEFINITIVE),
+    (re.compile(r"Co-authored-by:.*(?:claude|anthropic)", re.IGNORECASE), "Claude/Anthropic co-author trailer", Confidence.DEFINITIVE),
+    (re.compile(r"Co-authored-by:.*(?:cursor|ai-assistant|gpt|openai|codex)", re.IGNORECASE), "AI tool co-author trailer", Confidence.DEFINITIVE),
+    (re.compile(r"Generated-by:.*(?:claude|copilot|cursor|gpt|codex|gemini)", re.IGNORECASE), "AI tool generation trailer", Confidence.DEFINITIVE),
+    (re.compile(r"AI-generated|ai-generated|aider|lovable|bolt|v0\.dev", re.IGNORECASE), "AI generation attribution marker", Confidence.DEFINITIVE),
+]
+AI_MESSAGE_PATTERNS = [
+    (re.compile(r"^Apply suggestions from code review$", re.IGNORECASE), "GitHub Copilot suggestion commit", Confidence.DEFINITIVE),
+    (re.compile(r"^Update \S+ with AI-generated", re.IGNORECASE), "Explicit AI-generated update", Confidence.DEFINITIVE),
+    (re.compile(r"^(?:feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)\([^)]+\)!?:\s.{20,120}$"), "Precisely-scoped conventional commit (AI-characteristic length)", Confidence.LOW),
+    (re.compile(r"^(?:feat|fix|docs|refactor|chore):\s.+\n\n(?:- .+\n){3,}"), "Conventional commit with structured bullet-point body", Confidence.MEDIUM),
+]
+AI_FILE_MARKERS = [
+    (".claude/", "Claude Code configuration directory"), ("CLAUDE.md", "Claude Code project file"),
+    (".cursor/", "Cursor AI configuration"), (".codex/", "OpenAI Codex configuration"),
+    ("AGENTS.md", "AI agent configuration file"), (".github/copilot/", "GitHub Copilot configuration"),
+    (".aider.conf.yml", "Aider AI configuration"), (".aider/", "Aider AI directory"),
+    (".codeium/", "Codeium AI configuration"), (".continue/", "Continue AI configuration"),
+    (".v0/", "v0.dev project directory"), (".bolt/", "Bolt AI project directory"),
+    (".lovable/", "Lovable AI project directory"),
+]
+AI_COMMENT_PATTERNS = [
+    re.compile(r"(?:^|\s)# (?:TODO|FIXME|HACK|NOTE|REVIEW|OPTIMIZE|WARNING):.*AI.*generated", re.IGNORECASE),
+    re.compile(r"(?:^|\s)// (?:Auto-generated|Generated by|This (?:file|code) (?:was |is )?(?:auto-?)?generated)", re.IGNORECASE),
+    re.compile(r"(?:^|\s)# (?:Auto-generated|Generated by|This (?:file|code) (?:was |is )?(?:auto-?)?generated)", re.IGNORECASE),
+    re.compile(r'""".*(?:Auto-generated|Generated by AI|AI-generated).*"""', re.IGNORECASE | re.DOTALL),
+]
+
+
+def _run_git(repo_path, args, timeout=30):
+    try:
+        result = subprocess.run(["git", "-C", repo_path] + args, capture_output=True, text=True, timeout=timeout)
+        return result.stdout if result.returncode == 0 else None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+def get_commits(repo_path, max_commits=200):
+    SEP = "\x1f"
+    fmt = SEP.join(["%H", "%an", "%ae", "%aI", "%s"])
+    raw = _run_git(repo_path, ["log", f"--max-count={max_commits}", f"--format={fmt}", "--no-merges"])
+    if not raw: return []
+    commits = []
+    for line in raw.strip().split("\n"):
+        if not line.strip(): continue
+        parts = line.split(SEP)
+        if len(parts) >= 5:
+            commits.append({"hash": parts[0], "author_name": parts[1], "author_email": parts[2], "timestamp": parts[3], "subject": parts[4]})
+    return commits
+
+def get_commit_body(repo_path, commit_hash):
+    raw = _run_git(repo_path, ["log", "-1", "--format=%B", commit_hash])
+    return raw.strip() if raw else ""
+
+def get_commit_diff_stats(repo_path, commit_hash):
+    raw = _run_git(repo_path, ["diff-tree", "--no-commit-id", "--numstat", "-r", commit_hash])
+    if not raw:
+        return {"files_changed": 0, "insertions": 0, "deletions": 0, "new_files": 0, "large_additions": 0}
+    fc = ins = dels = nf = la = 0
+    for line in raw.strip().split("\n"):
+        if not line.strip(): continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            fc += 1
+            try:
+                a = int(parts[0]) if parts[0] != "-" else 0
+                r = int(parts[1]) if parts[1] != "-" else 0
+                ins += a; dels += r
+                if a > 0 and r == 0: nf += 1
+                if a > 100: la += 1
+            except ValueError: pass
+    return {"files_changed": fc, "insertions": ins, "deletions": dels, "new_files": nf, "large_additions": la}
+
+def get_commit_diff_sample(repo_path, commit_hash, max_lines=200):
+    raw = _run_git(repo_path, ["diff-tree", "-p", "--no-commit-id", "-r", "--diff-filter=AM", commit_hash], timeout=10)
+    if not raw: return ""
+    return "\n".join(raw.split("\n")[:max_lines])
+
+def check_file_markers(repo_path):
+    found = []
+    for marker, desc in AI_FILE_MARKERS:
+        if (Path(repo_path) / marker).exists():
+            found.append({"marker": marker, "description": desc})
+    return found
+
+
+class CommitAnalyzer:
+    def __init__(self, repo_path, max_commits=200):
+        self.repo_path = repo_path
+        self.max_commits = max_commits
+
+    def scan(self):
+        report = ScanReport(repo_path=self.repo_path)
+        if not _run_git(self.repo_path, ["rev-parse", "--git-dir"]):
+            report.signals.append(Signal(rule_id="ERR-001", confidence=Confidence.LOW, commit_hash="", message="Not a git repository"))
+            return report
+        commits = get_commits(self.repo_path, self.max_commits)
+        report.total_commits = len(commits)
+        if not commits: return report
+        report.file_markers = check_file_markers(self.repo_path)
+        authors = {}
+        for commit in commits:
+            email = commit["author_email"]
+            if email not in authors:
+                authors[email] = AuthorProfile(name=commit["author_name"], email=email)
+            authors[email].total_commits += 1
+            self._check_trailers(report, authors[email], commit)
+            self._check_message_patterns(report, authors[email], commit)
+            self._check_diff_structure(report, authors[email], commit)
+        for email, author in authors.items():
+            ac = [c for c in commits if c["author_email"] == email]
+            self._check_timing_patterns(report, author, ac)
+        for email, author in authors.items():
+            ac = [c for c in commits if c["author_email"] == email]
+            self._check_message_uniformity(report, author, ac)
+        for email, author in authors.items():
+            if author.total_commits > 0:
+                sw = sum(s.confidence.weight for s in author.signals)
+                author.ai_score = min(100.0, (sw / author.total_commits) * 100)
+                if report.file_markers and author.signals:
+                    author.ai_score = min(100.0, author.ai_score * 1.2)
+        report.authors = sorted(authors.values(), key=lambda a: a.ai_score, reverse=True)
+        report.total_authors = len(report.authors)
+        for author in report.authors:
+            if author.ai_score >= 50: report.ai_commit_estimate += author.total_commits
+        if report.total_commits > 0:
+            report.overall_ai_percentage = (report.ai_commit_estimate / report.total_commits) * 100
+        return report
+
+    def check_commit(self, commit_hash):
+        raw = _run_git(self.repo_path, ["log", "-1", "--format=%H\x1f%an\x1f%ae\x1f%aI\x1f%s", commit_hash])
+        if not raw: return []
+        parts = raw.strip().split("\x1f")
+        if len(parts) < 5: return []
+        commit = {"hash": parts[0], "author_name": parts[1], "author_email": parts[2], "timestamp": parts[3], "subject": parts[4]}
+        report = ScanReport(repo_path=self.repo_path)
+        author = AuthorProfile(name=commit["author_name"], email=commit["author_email"])
+        author.total_commits = 1
+        self._check_trailers(report, author, commit)
+        self._check_message_patterns(report, author, commit)
+        self._check_diff_structure(report, author, commit)
+        self._check_code_patterns(report, author, commit)
+        return report.signals
+
+    def _check_trailers(self, report, author, commit):
+        body = get_commit_body(self.repo_path, commit["hash"])
+        for pattern, desc, conf in AI_TRAILER_PATTERNS:
+            if pattern.search(body):
+                s = Signal(rule_id="AUTH-001", confidence=conf, commit_hash=commit["hash"], message=desc, detail=commit["subject"][:80])
+                report.signals.append(s); author.signals.append(s)
+
+    def _check_message_patterns(self, report, author, commit):
+        body = get_commit_body(self.repo_path, commit["hash"])
+        full = commit["subject"] + "\n" + body
+        for pattern, desc, conf in AI_MESSAGE_PATTERNS:
+            if pattern.search(full):
+                s = Signal(rule_id="AUTH-002", confidence=conf, commit_hash=commit["hash"], message=desc, detail=commit["subject"][:80])
+                report.signals.append(s); author.signals.append(s)
+                break
+
+    def _check_diff_structure(self, report, author, commit):
+        stats = get_commit_diff_stats(self.repo_path, commit["hash"])
+        if stats["new_files"] >= 3 and stats["insertions"] > 500:
+            conf = Confidence.HIGH if (stats["new_files"] >= 5 and stats["insertions"] > 1000) else Confidence.MEDIUM
+            s = Signal(rule_id="AUTH-004", confidence=conf, commit_hash=commit["hash"],
+                      message=f"Bulk file creation: {stats['new_files']} new files, {stats['insertions']} insertions",
+                      detail="AI tools typically generate multiple complete files in a single commit")
+            report.signals.append(s); author.signals.append(s)
+        if stats["insertions"] > 300 and stats["deletions"] < 10:
+            ratio = stats["insertions"] / max(stats["deletions"], 1)
+            if ratio > 50:
+                s = Signal(rule_id="AUTH-004", confidence=Confidence.MEDIUM, commit_hash=commit["hash"],
+                          message=f"Pure addition commit: {stats['insertions']}+ / {stats['deletions']}- (ratio {ratio:.0f}:1)",
+                          detail="AI-generated code tends to be additive without iterative refinement")
+                report.signals.append(s); author.signals.append(s)
+
+    def _check_timing_patterns(self, report, author, author_commits):
+        if len(author_commits) < 3: return
+        timestamps = []
+        for c in author_commits:
+            try: timestamps.append(datetime.fromisoformat(c["timestamp"]))
+            except (ValueError, KeyError): continue
+        if len(timestamps) < 3: return
+        timestamps.sort()
+        for i in range(len(timestamps) - 2):
+            window = timestamps[i + 2] - timestamps[i]
+            if window < timedelta(minutes=5):
+                s = Signal(rule_id="AUTH-003", confidence=Confidence.MEDIUM, commit_hash=author_commits[i]["hash"],
+                          message=f"Commit burst: 3+ commits in {window.total_seconds():.0f}s",
+                          detail="Rapid commit sequences are characteristic of AI-assisted coding sessions")
+                report.signals.append(s); author.signals.append(s)
+                break
+        if len(timestamps) >= 5:
+            intervals = [(timestamps[i+1] - timestamps[i]).total_seconds() for i in range(len(timestamps)-1)]
+            short_iv = [iv for iv in intervals if iv < 3600]
+            if len(short_iv) >= 4:
+                mean_iv = sum(short_iv) / len(short_iv)
+                if mean_iv > 0:
+                    var = sum((iv - mean_iv)**2 for iv in short_iv) / len(short_iv)
+                    cv = math.sqrt(var) / mean_iv if mean_iv > 0 else float("inf")
+                    if cv < 0.3 and mean_iv < 600:
+                        s = Signal(rule_id="AUTH-003", confidence=Confidence.LOW, commit_hash=author_commits[0]["hash"],
+                                  message=f"Uniform commit intervals: avg {mean_iv:.0f}s, CV={cv:.2f}",
+                                  detail="Regular commit cadence may indicate automated or AI-assisted workflow")
+                        report.signals.append(s); author.signals.append(s)
+
+    def _check_message_uniformity(self, report, author, author_commits):
+        if len(author_commits) < 5: return
+        subjects = [c["subject"] for c in author_commits]
+        conv_pat = re.compile(r"^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([^)]+\))?!?:\s")
+        conv_count = sum(1 for s in subjects if conv_pat.match(s))
+        conv_ratio = conv_count / len(subjects)
+        if conv_ratio > 0.8 and len(subjects) >= 8:
+            avg_len = sum(len(s) for s in subjects) / len(subjects)
+            len_var = sum((len(s) - avg_len)**2 for s in subjects) / len(subjects)
+            len_cv = math.sqrt(len_var) / avg_len if avg_len > 0 else 0
+            if len_cv < 0.25 and avg_len > 30:
+                s = Signal(rule_id="AUTH-002", confidence=Confidence.MEDIUM, commit_hash=author_commits[0]["hash"],
+                          message=f"Uniform commit style: {conv_ratio:.0%} conventional, avg length {avg_len:.0f}, CV={len_cv:.2f}",
+                          detail="AI tools produce unusually consistent commit message formatting")
+                report.signals.append(s); author.signals.append(s)
+        prefixes = defaultdict(int)
+        for subj in subjects: prefixes[subj[:20].lower()] += 1
+        dupes = sum(v for v in prefixes.values() if v >= 3)
+        if dupes >= 5:
+            s = Signal(rule_id="AUTH-002", confidence=Confidence.MEDIUM, commit_hash=author_commits[0]["hash"],
+                      message=f"Repetitive commit prefixes: {dupes} commits share message templates",
+                      detail="Repeated message structures suggest templated/AI-generated messages")
+            report.signals.append(s); author.signals.append(s)
+
+    def _check_code_patterns(self, report, author, commit):
+        diff = get_commit_diff_sample(self.repo_path, commit["hash"])
+        if not diff: return
+        for pattern in AI_COMMENT_PATTERNS:
+            if pattern.search(diff):
+                s = Signal(rule_id="AUTH-005", confidence=Confidence.HIGH, commit_hash=commit["hash"],
+                          message="AI generation comment in code", detail="Code contains explicit AI-generation attribution in comments")
+                report.signals.append(s); author.signals.append(s)
+                break
+        added = [l[1:] for l in diff.split("\n") if l.startswith("+") and not l.startswith("+++")]
+        if len(added) > 50:
+            cpat = re.compile(r"^\s*(?:#|//|/\*|\*|<!--)")
+            cc = sum(1 for l in added if cpat.match(l))
+            cr = cc / len(added)
+            if cr > 0.35:
+                s = Signal(rule_id="AUTH-005", confidence=Confidence.LOW, commit_hash=commit["hash"],
+                          message=f"High comment density: {cr:.0%} of added lines are comments",
+                          detail="AI-generated code often has unusually high comment density")
+                report.signals.append(s); author.signals.append(s)
+
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+def format_report(report, use_color=True):
+    if not use_color:
+        global RESET, BOLD, DIM
+        RESET = BOLD = DIM = ""
+    lines = [""]
+    lines.append(f"{BOLD}=== crocking scan report ==={RESET}")
+    lines.append(f"  Repo: {report.repo_path}")
+    lines.append(f"  Commits analyzed: {report.total_commits}")
+    lines.append(f"  Authors: {report.total_authors}")
+    if report.overall_ai_percentage > 0:
+        lines.append("")
+        lines.append(f"  Estimated AI-authored commits: {report.ai_commit_estimate}/{report.total_commits} ({report.overall_ai_percentage:.0f}%)")
+    if report.file_markers:
+        lines.append("")
+        lines.append(f"  {BOLD}AI Tool Markers Found:{RESET}")
+        for m in report.file_markers:
+            lines.append(f"    * {m['marker']} - {m['description']}")
+    if report.authors:
+        lines.append("")
+        lines.append(f"  {BOLD}Per-Author Analysis:{RESET}")
+        for author in report.authors:
+            if author.ai_score < 5 and not author.signals: continue
+            score = author.ai_score
+            if score >= 70: label = "LIKELY AI"
+            elif score >= 40: label = "POSSIBLE AI"
+            elif score >= 15: label = "SOME SIGNALS"
+            else: label = "LOW"
+            lines.append("")
+            lines.append(f"  {BOLD}  {author.name} <{author.email}>{RESET}")
+            lines.append(f"    Score: {score:.0f}/100 - {label}")
+            lines.append(f"    Commits: {author.total_commits}  Signals: {len(author.signals)}")
+            by_rule = defaultdict(list)
+            for s in author.signals: by_rule[s.rule_id].append(s)
+            for rule_id, sigs in sorted(by_rule.items()):
+                count_str = f" ({len(sigs)}x)" if len(sigs) > 1 else ""
+                lines.append(f"      [{rule_id}] {sigs[0].message}{count_str}")
+    clean = [a for a in report.authors if a.ai_score < 5 and not a.signals]
+    if clean:
+        lines.append("")
+        names = ", ".join(a.name for a in clean[:5])
+        if len(clean) > 5: names += f", +{len(clean) - 5} more"
+        lines.append(f"  {DIM}No AI signals: {names}{RESET}")
+    if not report.signals and not report.file_markers:
+        lines.append("")
+        lines.append("  No AI authorship signals detected.")
+    lines.append("")
+    return "\n".join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(prog="crocking", description="AI authorship detector for git repositories")
+    parser.add_argument("--version", action="version", version=f"crocking {__version__}")
+    sub = parser.add_subparsers(dest="command")
+    scan_p = sub.add_parser("scan", help="Scan a repo for AI authorship signals")
+    scan_p.add_argument("repo", nargs="?", default=".", help="Path to git repository")
+    scan_p.add_argument("--max-commits", type=int, default=200, help="Max commits to analyze")
+    scan_p.add_argument("--format", choices=["human", "json"], default="human")
+    scan_p.add_argument("--no-color", action="store_true")
+    check_p = sub.add_parser("check", help="Analyze a single commit")
+    check_p.add_argument("commit", help="Commit hash to analyze")
+    check_p.add_argument("--repo", default=".", help="Path to git repository")
+    check_p.add_argument("--format", choices=["human", "json"], default="human")
+    check_p.add_argument("--no-color", action="store_true")
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return 2
+    if args.command == "scan":
+        analyzer = CommitAnalyzer(args.repo, args.max_commits)
+        report = analyzer.scan()
+        if args.format == "json": print(json.dumps(report.to_dict(), indent=2))
+        else: print(format_report(report, use_color=not args.no_color))
+        return 0
+    elif args.command == "check":
+        analyzer = CommitAnalyzer(args.repo)
+        signals = analyzer.check_commit(args.commit)
+        if args.format == "json": print(json.dumps([s.to_dict() for s in signals], indent=2))
+        else:
+            if signals:
+                for s in signals:
+                    print(f"  [{s.rule_id}] {s.confidence.value}: {s.message}")
+                    if s.detail: print(f"    {s.detail}")
+            else: print("  No AI authorship signals detected for this commit.")
+        return 0
+    return 0
