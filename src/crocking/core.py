@@ -164,6 +164,23 @@ def check_file_markers(repo_path):
     return found
 
 
+def _parse_timestamp(ts_str):
+    """Parse ISO 8601 timestamp, compatible with Python 3.9+."""
+    # Python 3.9/3.10 fromisoformat doesn't handle timezone offsets
+    # Strip timezone for compat, we only need relative ordering
+    ts = ts_str
+    if "+" in ts[10:]:
+        ts = ts[:ts.rindex("+")]
+    elif ts.endswith("Z"):
+        ts = ts[:-1]
+    # Also handle negative offsets
+    if "-" in ts[11:] and len(ts) > 19:
+        # Find the last hyphen that's part of timezone (after T and time)
+        idx = ts.rindex("-")
+        if idx > 10:
+            ts = ts[:idx]
+    return datetime.fromisoformat(ts)
+
 class CommitAnalyzer:
     def __init__(self, repo_path, max_commits=200):
         self.repo_path = repo_path
@@ -258,7 +275,7 @@ class CommitAnalyzer:
         if len(author_commits) < 3: return
         timestamps = []
         for c in author_commits:
-            try: timestamps.append(datetime.fromisoformat(c["timestamp"]))
+            try: timestamps.append(_parse_timestamp(c["timestamp"]))
             except (ValueError, KeyError): continue
         if len(timestamps) < 3: return
         timestamps.sort()
