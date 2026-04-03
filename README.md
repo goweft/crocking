@@ -24,6 +24,8 @@ crocking check abc123def
 crocking scan . --max-commits 500
 ```
 
+![crocking demo](demo.svg)
+
 ## What It Detects
 
 ### Known AI Markers (AUTH-001)
